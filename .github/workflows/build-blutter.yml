@@ -1,0 +1,182 @@
+# --------------------------------------------------------------------------
+# Standalone workflow: builds blutter for Dart 3.11.5 / android arm64 on Windows.
+#
+# NO input files required - this is the only file you add.
+#
+# Setup:
+#   1. Fork https://github.com/worawit/blutter
+#   2. Add this file to the fork as .github/workflows/build-blutter.yml
+#   3. Actions -> "Build Blutter" -> Run workflow
+#
+# Why no libapp.so is needed:
+#   Step "Fetch and build Dart VM library" compiles the Dart VM from source at
+#   tag 3.11.5 with TARGET_OS=android TARGET_ARCH=arm64 COMPRESSED_PTRS=1 and
+#   bakes the target snapshot hash into runtime/vm/version.cc, so the produced
+#   tool accepts exactly this app's libapp.so (the snapshot version check is a
+#   hard check inside the Dart VM and cannot be patched around).
+#   Step "Build blutter executable" then links blutter against that library.
+#   blutter.py always runs the freshly built exe on its input afterwards, so it
+#   is given a dummy file; the resulting failure is expected and ignored - only
+#   the existence of the exe is verified.
+#
+# Output: blutter_dartvm3.11.5_android_arm64.exe + capstone/icu DLLs, as a
+# workflow artifact and as a GitHub release asset.
+# --------------------------------------------------------------------------
+name: Build Blutter
+
+on:
+  workflow_dispatch:
+    inputs:
+      no_analysis:
+        description: 'Build with --no-analysis (drops code analysis support)'
+        required: false
+        default: false
+        type: boolean
+      rebuild:
+        description: 'Force blutter executable rebuild'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DART_VERSION: '3.11.5'
+  OS_NAME: 'android'
+  ARCH: 'arm64'
+  SNAPSHOT_HASH: '78da37fed6bf1489361a312568249f3f'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout blutter fork
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyelftools requests
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Toolchain check
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+          ninja --version
+          python --version
+          (Get-Command cl).Source
+
+      - name: Download ICU and capstone
+        shell: pwsh
+        run: python scripts\init_env_win.py
+
+      - name: Compute name suffix
+        id: cfg
+        shell: pwsh
+        run: |
+          $suffix = ''
+          if ('${{ inputs.no_analysis }}' -eq 'true') { $suffix = '_no-analysis' }
+          "name_suffix=$suffix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Restore built Dart VM library (cache)
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: packages
+          key: dartvm-${{ env.DART_VERSION }}-${{ env.OS_NAME }}-${{ env.ARCH }}-${{ env.SNAPSHOT_HASH }}${{ steps.cfg.outputs.name_suffix }}
+
+      - name: Fetch and build Dart VM library
+        shell: pwsh
+        run: |
+          $dartlib = "dartvm$($env:DART_VERSION)_$($env:OS_NAME)_$($env:ARCH)"
+          $lib = "packages/lib/$dartlib.lib"
+          if (Test-Path $lib) {
+            Write-Host "Reusing cached $lib"
+            exit 0
+          }
+          python dartvm_fetch_build.py $env:DART_VERSION $env:OS_NAME $env:ARCH $env:SNAPSHOT_HASH
+
+      - name: Save Dart VM library (cache)
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: packages
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Build blutter executable
+        shell: pwsh
+        run: |
+          $dartlib = "dartvm$($env:DART_VERSION)_$($env:OS_NAME)_$($env:ARCH)"
+          $suffix = '${{ steps.cfg.outputs.name_suffix }}'
+          $exe = "bin/blutter_$dartlib$suffix.exe"
+
+          $extra = @()
+          if ('${{ inputs.no_analysis }}' -eq 'true') { $extra += '--no-analysis' }
+          if ('${{ inputs.rebuild }}' -eq 'true') { $extra += '--rebuild' }
+
+          # blutter.py ends by running the exe on its input; give it a dummy file.
+          New-Item -ItemType File -Force dummy_libapp.so | Out-Null
+          python blutter.py --dart-version "$($env:DART_VERSION)_$($env:OS_NAME)_$($env:ARCH)" @extra dummy_libapp.so out
+          $code = $LASTEXITCODE
+
+          if (-not (Test-Path $exe)) {
+            throw "blutter build failed (blutter.py exit $code): $exe not found"
+          }
+          Write-Host "Built $exe"
+          Write-Host "blutter.py exit code $code is expected - it tried to analyse the dummy file."
+          exit 0
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        run: |
+          $dartlib = "dartvm$($env:DART_VERSION)_$($env:OS_NAME)_$($env:ARCH)"
+          $suffix = '${{ steps.cfg.outputs.name_suffix }}'
+          $tag = ("$dartlib$($suffix -replace '_','-')").TrimEnd('-')
+          $name = "blutter-$tag-windows"
+
+          $stage = "pkg/$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "bin/blutter_$dartlib$suffix.exe" $stage
+          Copy-Item bin/*.dll $stage
+          Compress-Archive -Path $stage -DestinationPath "$name.zip" -Force
+
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host "zip: $name.zip"
+          "pkg_name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg_name }}
+          path: ${{ steps.pkg.outputs.pkg_name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.pkg_name }}
+          name: blutter dartvm${{ env.DART_VERSION }} ${{ env.OS_NAME }} ${{ env.ARCH }} (Windows)
+          body: |
+            blutter for Dart ${{ env.DART_VERSION }} / ${{ env.OS_NAME }} / ${{ env.ARCH }}, built on windows-latest.
+            Snapshot hash baked in: ${{ env.SNAPSHOT_HASH }}
+
+            Extract the zip and run:
+            blutter_dartvm${{ env.DART_VERSION }}_${{ env.OS_NAME }}_${{ env.ARCH }}.exe -i libapp.so -o out
+          files: ${{ steps.pkg.outputs.pkg_name }}.zip
+          fail_on_unmatched_files: true
