@@ -39,10 +39,10 @@ on:
         type: boolean
 
 env:
-  DART_VERSION: '3.11.5'
+  DART_VERSION: '3.13.0'
   OS_NAME: 'android'
   ARCH: 'arm64'
-  SNAPSHOT_HASH: '78da37fed6bf1489361a312568249f3f'
+  SNAPSHOT_HASH: '0451907c2eaa8467e848c0067bfe8ed4'
 
 permissions:
   contents: write
